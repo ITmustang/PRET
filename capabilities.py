@@ -3,6 +3,7 @@
 
 # python standard library
 import re
+import asyncio
 import os
 import sys  # , urllib.error, urllib.parse
 
@@ -15,9 +16,13 @@ from helper import output, item
 
 # third party modules
 try:
-    from pysnmp.entity.rfc3413.oneliner import cmdgen
-except ImportError:
-    pass
+    from pysnmp.hlapi.v3arch.asyncio import (
+        SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
+        ObjectType, ObjectIdentity, walk_cmd,
+    )
+    snmp_import_error = None
+except ImportError as exc:
+    snmp_import_error = str(exc)
 
 
 class capabilities():
@@ -142,21 +147,9 @@ class capabilities():
             desc, desc_oid = [], '1.3.6.1.2.1.25.3.2.1.3'
             # Printer-MIB → prtInterpreterDescription
             pdls, pdls_oid = [], '1.3.6.1.2.1.43.15.1.1.5.1'
-            error, error_status, idx, binds = cmdgen.CommandGenerator().nextCmd(
-                cmdgen.CommunityData('public', mpModel=0), cmdgen.UdpTransportTarget(
-                    (host, 161), timeout=self.timeout, retries=0), desc_oid, pdls_oid)
-            # exit on error
-            if error:
-                raise Exception(error)
-            if error_status:
-                raise Exception(error_status.prettyPrint())
-            # parse response
-            for row in binds:
-                for key, val in row:
-                    if desc_oid in str(key):
-                        desc.append(str(val))
-                    if pdls_oid in str(key):
-                        pdls.append(str(val))
+            if snmp_import_error is not None:
+                raise RuntimeError("PySNMP 7 asyncio API unavailable: " + snmp_import_error)
+            desc, pdls = asyncio.run(self._snmp_walk(host, desc_oid, pdls_oid))
             # get name of device
             model = item(desc)
             # get language support
@@ -165,10 +158,32 @@ class capabilities():
                 re.escape(pdl), langs, re.I) for pdl in lang] if _f]
             # self.set_support(model)
             output().green("found")
-        except NameError:
-            output().errmsg("not found", "pysnmp module not installed")
         except Exception as e:
             output().errmsg("not found", e)
+    async def _snmp_walk(self, host, desc_oid, pdls_oid):
+        engine = SnmpEngine()
+        found = {desc_oid: [], pdls_oid: []}
+        try:
+            target = await UdpTransportTarget.create(
+                (host, 161), timeout=self.timeout, retries=0)
+            for root in (desc_oid, pdls_oid):
+                async for error, status, index, binds in walk_cmd(
+                        engine, CommunityData('public', mpModel=0), target,
+                        ContextData(), ObjectType(ObjectIdentity(root)),
+                        lexicographicMode=False, lookupMib=False,
+                        maxRows=256, maxCalls=256):
+                    if error:
+                        raise RuntimeError(str(error))
+                    if status:
+                        raise RuntimeError(status.prettyPrint())
+                    for key, value in binds:
+                        # Match descendants, not coincidental substrings.
+                        if str(key).startswith(root + '.'):
+                            found[root].append(str(value))
+            return found[desc_oid], found[pdls_oid]
+        finally:
+            engine.close_dispatcher()
+
     # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     # feedback on language support
 
@@ -206,3 +221,4 @@ class capabilities():
         except IOError as e:
             output().errmsg("Cannot open file", e)
             return []
+                      
